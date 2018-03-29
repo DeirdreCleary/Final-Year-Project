@@ -1,0 +1,450 @@
+class Future{
+  int val;
+
+  modifies val;
+  requires n > 0 && (val == 0 || val == (n*2)+1);
+  ensures val == n*2;
+  process insert(int n);
+
+  modifies val;
+  requires n > 0 && val == n*2;
+  ensures val == (n*2)+1;
+  process delete(int n);
+  
+  ensures val == 0;
+  process Empty(int n) = (0<n) ? ((insert(n) * Holds(n)) + Empty(n-1)) : empty;
+  ensures val == n*2;
+  process Holds(int n) = delete(n) * Tomb(n);
+  ensures val == (n*2)+1;
+  process Tomb(int n)  = insert(n) * Holds(n);
+}
+
+class AtomicCell {
+  Future f;
+  
+  resource lock_invariant() = Value(f) ** HPerm(f.val, write);
+
+  
+  AtomicCell(){
+    f = new Future();
+    f.val = 0;
+    create f, f.Empty(123);
+  }
+  
+  context Value(f);
+  context Perm(f.val,1);
+  ensures \result ==> f.val == desired;
+  ensures !\result ==> f.val == \old(f.val);
+  ensures (\old(f.val) == expected) == \result;
+  boolean cas(int expected, int desired) {
+    if(f.val == expected){ f.val = desired; return true;}
+    return false;
+  }
+
+  given frac p;
+  given process P;
+  yields boolean tombed;
+  yields int actual_answer;
+  requires 0 < n && n <= 123;
+  context p != none;
+  context Perm(f,p);
+  context Future(f, p, P);
+  ensures p == \old(p);
+  ensures (\result && (actual_answer == n) && !tombed) == (P == f.Holds(n));
+  ensures \result ==> (f.Holds(n) == \old(P));
+  ensures (!\result && !tombed && actual_answer != 0) ==> (f.Holds(actual_answer) == \old(P)); 
+  ensures (!\result && tombed && actual_answer != 0) ==> (f.Tomb(actual_answer) == \old(P));
+  ensures (actual_answer == 0) ==> (f.Empty(123) == \old(P));
+  // ensures !\result ==> Future(f, p, P); should work. If P == old(P) then it's just permissions
+  boolean contains(int n){
+    int lifted_val = lift_val(n);
+    int tombed_val = tomb_val(n);
+    // Atomic Read
+    lock this;
+    int current = f.val;
+    unlock this;
+    // End Atomic Read
+    actual_answer = 0;
+    // Empty, already tomb, and not ours :(
+    if (current == 0){
+      assume Perm(f, p);
+      assume P == f.Empty(123) && f.Empty(123) != f.Holds(n);
+      return false;
+    }
+    assume current >= 2;
+    tombed = is_tombed(current);
+    int extracted_val = extract_val(current);
+    assert extracted_val > 0;
+    actual_answer = extracted_val;
+    if(current == tombed_val){
+      assume P == f.Tomb(n) && f.Tomb(n) != f.Holds(n);
+      assume Perm(f, p);
+      return false;
+    }
+    if(current == lifted_val){
+      assume P == f.Holds(n);
+      assume Perm(f,p);
+      return true;
+    }
+    assert actual_answer != n;
+    if(tombed){
+      assume P == f.Tomb(extracted_val) && f.Tomb(extracted_val) != f.Holds(n);
+      assume Perm(f,p);
+      return false;
+    } else {
+      assume P == f.Holds(extracted_val) && f.Holds(extracted_val) != f.Holds(n);
+      assume Perm(f,p);
+      return false;
+    }
+  }  
+
+  given frac p;
+  given process P;
+  yields boolean tombed;
+  context p != none;
+  context Perm(f,p);
+  context Future(f, p, P);
+  ensures p == \old(p);
+  ensures ((\result != 0) && tombed) ==> (P == f.Tomb(\result)); // Sebastian
+  ensures ((\result != 0) && !tombed) ==> (f.Holds(\result) == \old(P));
+  ensures (\result == 0 && !tombed) ==> (f.Empty(123) == \old(P));
+  int load(){
+    // Atomic Read
+    lock this;
+    int current = f.val;
+    unlock this;
+    if(current == 0){
+      tombed = false;
+      assume P == f.Empty(123);
+      assume Perm(f,p);
+      return 0;
+    }
+    // End Atomic Read
+    assume current >= 2;
+    boolean is_tombstone = is_tombed(current);
+    tombed = is_tombstone;
+    int real_current = extract_val(current);
+    if(is_tombstone && real_current > 0){
+      assume P == f.Tomb(real_current);
+      assume Perm(f,p);
+      tombed = true;
+      assert tombed == (P == f.Tomb(real_current));
+      return real_current;
+    }
+    assume P == f.Holds(real_current);
+    assume Perm(f,p);
+    return real_current;
+  }  
+
+  given frac p;
+  given process P;
+  yields int value_found;
+  yields boolean tombed;
+  requires 0 < n && n <= 123;
+  context p != none;
+  context Perm(f,p);
+  requires Future(f, p, P);
+  ensures \result ==> Future(f, p, f.Holds(n));
+  ensures \result ==> (P == f.Holds(n));
+  //ensures !\result ==>
+  ensures p == \old(p);
+  ensures !\result ==> Future(f, p, P);
+  boolean insert(int n){
+    int lifted_val = lift_val(n);
+    int tombed_val = tomb_val(n);
+    value_found = 0;
+    // Atomic Read
+    lock this;
+    int current = f.val;
+    unlock this;
+    // End Atomic Read
+    boolean ret = false;
+    if(current == 0){
+      // CAS
+      lock this;
+      assert Value(f) ** HPerm(f.val,1);
+      if(f.val == 0){
+        assume P == f.Empty(n);
+        assert f.val == 0;
+        choose f, p, f.Empty(n), f.insert(n)*f.Holds(n);
+        action (f, p, f.Holds(n), f.insert(n)){
+          f.val = lifted_val; ret = true;
+        }
+        assume P == f.Holds(n); 
+      }
+      unlock this;
+      // End CAS
+    } 
+    if(current == tombed_val){
+      value_found = extract_val(current);
+      // CAS
+      lock this;
+      current = f.val;
+      assume current >= 2;
+      tombed = !is_tombed(current);
+      assert Value(f) ** HPerm(f.val, write);
+      if(current == tombed_val){
+        assume P == f.Tomb(n);
+        action (f, p, f.Holds(n), f.insert(n)){
+          f.val = lifted_val; ret = true;
+        }
+        assume P == f.Holds(n);
+      }
+      unlock this;
+      // End CAS
+    }
+    assume Perm(f,p);
+    return ret;
+  }
+
+
+  given frac p;
+  given process P;
+  requires 0 < n && n <= 123;
+  context p != none;
+  context Perm(f,p);
+  requires Future(f, p, P);
+  ensures \result ==> Future(f,p,f.Tomb(n));
+  ensures !\result ==> Future(f,p,P);
+  boolean delete(int n){
+    int lifted_val = lift_val(n);
+    int tombed_val = tomb_val(n);
+    // Atomic Read
+    lock this;
+    int current = f.val;
+    unlock this;
+    // End Atomic Read
+    // Empty, already tomb, and not ours :(
+    if(current == 0 || current == tombed_val || current != lifted_val){
+      assume Perm(f,p);
+      return false;
+    }
+    boolean ret = false;
+    // CAS
+    lock this;
+    assert Value(f) ** HPerm(f.val,write);
+    if(f.val == lifted_val){
+      assume P == f.Holds(n);
+      assert f.val == lifted_val;
+      action (f, p, f.Tomb(n), f.delete(n)){
+        f.val = tombed_val; ret = true;
+      }
+    }
+    unlock this;
+    // End CAS
+    assume Perm(f,p);
+    return ret;
+  }
+  
+
+  // Helpers
+  requires n > 0;
+  ensures \result == (\old(n) * 2);
+  int lift_val(int n){
+    return n * 2;
+  }
+
+  requires n > 0;
+  ensures \result == (\old(n) * 2) + 1;
+  int tomb_val(int n){
+    return (n * 2) + 1;
+  }
+
+  requires n > 1;
+  ensures \result == (\old(n) / 2);
+  int extract_val(int n){
+    return n / 2;
+  }
+
+  requires n > 0;
+  ensures \result == ((n % 2) == 1);
+  boolean is_tombed(int n){
+    return (n % 2) == 1;
+  }
+}
+
+class Hashset{
+  AtomicCell[] array;
+
+  requires 0 < n ** n < 123;
+  Hashset(int n){
+    array = new AtomicCell[n];
+  }
+
+
+  given process[] PS;
+  given frac p;
+  yields int effectLocation;
+  context p != none;
+  context PS != null;
+  ensures p == \old(p);
+  context Value(array) ** array != null ** array.length > 0 ** (\forall* int i; 0 <= i && i < array.length; Value(array[i]));
+  context PS.length == array.length;
+  context (\forall* int i; 0 <= i && i < array.length; Perm(array[i].f, p) ** Perm(PS[i],p));
+  requires (\forall* int i; 0 <= i && i < array.length; Future(array[i].f, p, PS[i]));
+  requires 0 < entry ** entry < 123;
+  ensures 0 <= effectLocation ** effectLocation < array.length;
+  ensures \result ==> Future(array[effectLocation].f, p, array[effectLocation].f.Holds(entry));
+  ensures !\result ==> (\forall int i; 0 <= i && i <= effectLocation; PS[i] != array[i].f.Holds(entry));
+  boolean contains(int entry)
+  {
+    int originalSlot = 0; // hash(entry);
+    int curSlot = originalSlot;
+    int length = array.length;
+
+    loop_invariant Value(array) ** array != null ** array.length > 0 ** (\forall* int i; 0 <= i && i < array.length; Value(array[i]));
+    loop_invariant PS.length == array.length;
+    loop_invariant 0 <= curSlot ** curSlot <= array.length ** curSlot <= PS.length;
+    loop_invariant (\forall* int i; 0 <= i && i < array.length; Perm(array[i].f, p) ** Perm(PS[i],p));
+    loop_invariant (\forall int i; 0 <= i && i < curSlot; PS[i] != array[i].f.Holds(entry));
+    while(curSlot < length){
+      assume (\forall* int i; 0 <= i && i < array.length; Future(array[i].f, p, PS[i]));
+      boolean res = array[curSlot].contains(entry) with {p = p; P = PS[curSlot];};
+      if(res){
+        effectLocation = curSlot;
+        assert (PS[curSlot] == array[curSlot].f.Holds(entry));
+        return true;
+      }
+      int val = array[curSlot].load() with {p = p; P = PS[curSlot];};
+      if(val == 0){
+        assert val != entry;
+        assert PS[curSlot] != array[curSlot].f.Holds(entry);
+        effectLocation = curSlot;
+        assert(\forall int i; 0 <= i && i <= curSlot; PS[i] != array[i].f.Holds(entry));
+        return false;
+      }
+      curSlot = (curSlot + 1);
+    }
+    effectLocation = array.length - 1;
+    assert (\forall int i; 0 <= i && i <= effectLocation; PS[i] != array[i].f.Holds(entry));
+    return false;
+  }
+
+  given process[] PS;
+  given frac p;
+  yields int effectLocation;
+  yields boolean full;
+  context p != none;
+  context PS != null;
+  ensures p == \old(p);
+  context Value(array) ** array != null ** array.length > 0 ** (\forall* int i; 0 <= i && i < array.length; Value(array[i]));
+  context PS.length == array.length;
+  context (\forall* int i; 0 <= i && i < array.length; Perm(array[i].f, p) ** Perm(PS[i],p));
+  requires (\forall* int i; 0 <= i && i < array.length; Future(array[i].f, p, PS[i]));
+  requires 0 < entry ** entry < 123;
+  ensures 0 <= effectLocation ** effectLocation < array.length;
+  ensures \result ==> Future(array[effectLocation].f, p, array[effectLocation].f.Holds(entry));
+  ensures \result ==> (\forall int i; 0 <= i && i < effectLocation; PS[i] != array[i].f.Holds(entry));
+  ensures full ==> !\result;
+  ensures full ==> (\forall int i; 0 <= i && i < array.length; PS[i] != array[i].f.Holds(entry));
+  // ensures !\result ==> (\forall* int i; 0 <= i && i < array.length; Future(array[i].f, p, PS[i])); // should hold, VerCors issue
+  boolean insert(int entry)
+  {
+    int originalSlot = 0; // hash(entry);
+    int curSlot = originalSlot;
+    int length = array.length;
+    full = false;
+
+    loop_invariant Value(array) ** array != null ** array.length > 0 ** (\forall* int i; 0 <= i && i < array.length; Value(array[i]));
+    loop_invariant PS.length == array.length;
+    loop_invariant 0 <= curSlot ** curSlot <= array.length ** curSlot <= PS.length;
+    loop_invariant (\forall* int i; 0 <= i && i < array.length; Perm(array[i].f, p) ** Perm(PS[i],p));
+    loop_invariant (\forall int i; 0 <= i && i < curSlot; PS[i] != array[i].f.Holds(entry));
+    while(curSlot < length){
+      assume (\forall* int i; 0 <= i && i < array.length; Future(array[i].f, p, PS[i]));
+
+      boolean insert_res = array[curSlot].insert(entry) with {p = p; P = PS[curSlot];};
+      assert insert_res ==> Future(array[curSlot].f, p, array[curSlot].f.Holds(entry));
+      if(insert_res){
+        assert(\forall int i; 0 <= i && i < curSlot; PS[i] != array[i].f.Holds(entry));
+        assert PS[curSlot] == array[curSlot].f.Holds(entry);
+        effectLocation = curSlot;
+        return true;
+      }
+      boolean contains_res = array[curSlot].contains(entry) with {p = p; P = PS[curSlot];};
+      assert contains_res ==> Future(array[curSlot].f, p, array[curSlot].f.Holds(entry));
+      if(contains_res){
+        assert(\forall int i; 0 <= i && i < curSlot; PS[i] != array[i].f.Holds(entry));
+        assert contains_res == (PS[curSlot] == array[curSlot].f.Holds(entry));
+        effectLocation = curSlot;
+        return false;
+      }
+      curSlot = (curSlot + 1);
+    }
+    effectLocation = array.length - 1;
+    assert (\forall int i; 0 <= i && i <= effectLocation; PS[i] != array[i].f.Holds(entry));
+    full = true;
+    return false;
+  }
+
+  given process[] PS;
+  given frac p;
+  yields int effectLocation;
+  context p != none;
+  context PS != null;
+  ensures p == \old(p);
+  context Value(array) ** array != null ** array.length > 0 ** (\forall* int i; 0 <= i && i < array.length; Value(array[i]));
+  context PS.length == array.length;
+  context (\forall* int i; 0 <= i && i < array.length; Perm(array[i].f, p) ** Perm(PS[i],p));
+  requires (\forall* int i; 0 <= i && i < array.length; Future(array[i].f, p, PS[i]));
+  requires 0 < entry ** entry < 123;
+  ensures 0 <= effectLocation ** effectLocation < array.length;
+  ensures \result ==> Future(array[effectLocation].f, p, array[effectLocation].f.Tomb(entry));
+  // ensures !\result ==> (\forall* int i; 0 <= i && i < array.length; Future(array[i].f, p, PS[i])); // should hold, VerCors issue
+  boolean delete(int entry)
+  {
+    /*int originalSlot = 0; // hash(entry);
+    int curSlot = originalSlot;
+    int length = array.length;
+
+    loop_invariant Value(array) ** array != null ** array.length > 0 ** (\forall* int i; 0 <= i && i < array.length; Value(array[i]));
+    loop_invariant PS.length == array.length;
+    loop_invariant 0 <= curSlot ** curSlot <= array.length ** curSlot <= PS.length;
+    loop_invariant (\forall* int i; 0 <= i && i < array.length; Perm(array[i].f, p) ** Perm(PS[i],p));
+    loop_invariant (\forall int i; 0 <= i && i < curSlot; PS[i] != array[i].f.Holds(entry));
+    while(curSlot < length){
+      assume (\forall* int i; 0 <= i && i < array.length; Future(array[i].f, p, PS[i]));
+      boolean res = array[curSlot].contains(entry) with {p = p; P = PS[curSlot];};
+      if(res){
+        bool delete_res = array[curSlot].delete(entry) with {p = p; P = PS[curSlot];};
+        if(delete_res){
+
+        }
+        effectLocation = curSlot;
+        return true;
+      }
+      int val = array[curSlot].load() with {p = p; P = PS[curSlot];};
+      if(val == 0){
+        assert val != entry;
+        assert PS[curSlot] != array[curSlot].f.Holds(entry);
+        effectLocation = curSlot;
+        assert(\forall int i; 0 <= i && i <= curSlot; PS[i] != array[i].f.Holds(entry));
+        return false;
+      }
+      curSlot = (curSlot + 1);
+    }
+    effectLocation = array.length - 1;
+    assert (\forall int i; 0 <= i && i <= effectLocation; PS[i] != array[i].f.Holds(entry));
+    return false;*/
+
+    int originalSlot = hash(entry);
+    int slotsChecked = 0;
+    boolean res = array[originalSlot].delete(entry) with {p = p; P = PS[originalSlot];};
+    assert !res ==> Future(array[originalSlot].f, p, PS[originalSlot]);
+    effectLocation = originalSlot;
+    assert res ==> Future(array[originalSlot].f, p, array[originalSlot].f.Tomb(entry));
+    return res;
+  }
+
+  context Value(array) ** array != null ** array.length > 0;
+  ensures \result >= 0 && \result < array.length;
+  int hash(int entry)
+  {
+      // (31 * (17 + e)) % a.length
+      if(entry < 0){
+        return (-1 * entry) % array.length;
+      } else {
+        return entry % array.length;
+      }
+  }
+}
